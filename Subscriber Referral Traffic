@@ -1,0 +1,258 @@
+SET ansi_mode = false;
+
+/* ---------------------------------- */
+/* PARAMETERS */
+/* ---------------------------------- */
+WITH params AS (
+  SELECT
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 8 DAYS AS start_date,
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 2 DAY AS end_date
+),
+/* ---------------------------------- */
+/* CONTENT METADATA */
+/* ---------------------------------- */
+content AS (
+  SELECT
+    l.id,
+    l.full_url,
+    l.hed,
+    l.original_author,
+    l.channel AS site_section,
+    l.type AS content_type,
+    l.original_pub_date,
+    MAX(p.published_date) AS latest_revision_date
+  FROM
+    gold_us_prod.content.gld_cross_brand_live l
+      LEFT JOIN silver_us_prod.content.slv_cross_brand_published p
+        ON l.id = p.id
+        AND p.brand = 'The New Yorker'
+  WHERE
+    lower(l.full_url) NOT LIKE '%verso%'
+    AND lower(l.hed) NOT LIKE '%crossword%'
+    AND lower(l.hed) NOT LIKE '%shuffalo%'
+    AND lower(l.hed) NOT LIKE '%puzzles-and-games%'
+    AND lower(l.hed) NOT LIKE '%catalogues%'
+  GROUP BY
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+),
+
+/* ---------------------------------- */
+/* SUBSCRIBERS */
+/* ---------------------------------- */
+subs AS (
+  SELECT DISTINCT
+    visit_date,
+    amgid
+  FROM
+    gold_us_prod.area_shared_analytics.subscribers_tny CROSS JOIN params p
+  WHERE
+    visit_date BETWEEN p.start_date AND p.end_date
+    AND amgid IS NOT NULL
+),
+/* ---------------------------------- */
+/* TRAFFIC */
+/* ---------------------------------- */
+traffic AS (
+  SELECT
+    wpv.content.id AS post_id,
+    wpv.domain_sessionid,
+    wpv.derived_tstamp AS ts_action,
+    wpv.traffic.referer_source,
+    wpv.traffic.referer_url_host,
+    wpv.traffic.referer_medium,
+    wpv.traffic.source_channel_group,
+    wpv.user.amgid AS user_amgid,
+    DATE(wpv.derived_tstamp) AS visit_dt
+  FROM
+    gold_us_prod.spruce.gld_web_page_views wpv CROSS JOIN params p
+  WHERE
+    wpv.app_id IN ('the-new-yorker', 'the-new-yorker-app')
+    AND DATE(wpv.derived_tstamp) BETWEEN p.start_date AND p.end_date
+    AND lower(wpv.page.url) NOT LIKE '%verso%'
+),
+/* ---------------------------------- */
+/* TAG SUBSCRIBER SESSIONS */
+/* ---------------------------------- */
+traffic_with_subs AS (
+  SELECT
+    t.*,
+    CASE
+      WHEN s.amgid IS NOT NULL THEN 1
+      ELSE 0
+    END AS is_subscriber
+  FROM
+    traffic t
+      LEFT JOIN subs s
+        ON t.user_amgid = s.amgid
+        AND t.visit_dt = s.visit_date
+),
+/* ---------------------------------- */
+/* CHANNEL MAPPING */
+/* ---------------------------------- */
+traffic_mapped AS (
+  SELECT
+    t.*,
+    CASE
+      WHEN
+        source_channel_group = 'Direct'
+        AND (
+          referer_source IS NULL
+          OR referer_source = ''
+        )
+      THEN
+        'Direct'
+      WHEN
+        source_channel_group = 'Organic Search'
+        OR (
+          (
+            lower(referer_source) = 'google'
+            AND referer_medium = 'search'
+          )
+          OR lower(referer_source) LIKE '%bing%'
+          OR lower(referer_source) LIKE '%duckduckgo%'
+          OR lower(referer_source) LIKE '%yahoo%'
+        )
+      THEN
+        'Organic Search'
+      WHEN
+        source_channel_group = 'Email'
+        OR lower(referer_source) LIKE '%nl%'
+      THEN
+        'Newsletter'
+      WHEN source_channel_group = 'Organic Social' THEN 'Organic Social'
+      WHEN lower(referer_source) LIKE '%facebook%' THEN 'Facebook'
+      WHEN lower(referer_source) LIKE '%youtube%' THEN 'YouTube'
+      WHEN
+        lower(referer_source) LIKE '%twitter%'
+        OR referer_url_host LIKE '%t.co%'
+      THEN
+        'Twitter'
+      WHEN lower(referer_source) LIKE '%instagram%' THEN 'Instagram'
+      WHEN referer_url_host LIKE '%threads%' THEN 'Threads'
+      WHEN lower(referer_source) LIKE '%linkedin%' THEN 'LinkedIn'
+      WHEN
+        lower(referer_source) LIKE '%chatgpt%'
+        OR lower(referer_source) LIKE '%perplexity%'
+        OR lower(referer_source) LIKE '%gemini%'
+        OR lower(referer_source) LIKE '%copilot%'
+        OR lower(referer_source) LIKE '%claude%'
+        OR referer_url_host LIKE '%openai.com%'
+      THEN
+        'AI Assistants'
+      WHEN
+        lower(referer_source) LIKE '%bluesky%'
+        OR referer_url_host LIKE '%bsky.app%'
+      THEN
+        'Bluesky'
+      WHEN
+        lower(referer_source) LIKE '%hacker%news%'
+        OR referer_url_host LIKE '%news.ycombinator.com%'
+      THEN
+        'Hacker News'
+      WHEN
+        lower(referer_source) LIKE '%tiktok%'
+        OR referer_url_host LIKE '%tiktok.com%'
+        OR lower(referer_source) LIKE '%likeshop%'
+        OR referer_url_host LIKE '%likeshop%'
+      THEN
+        'TikTok'
+      ELSE 'Other'
+    END AS mapped_source
+  FROM
+    traffic_with_subs t
+),
+/* ---------------------------------- */
+/* STORY JOIN */
+/* ---------------------------------- */
+story_traffic AS (
+  SELECT
+    s.id AS story_id,
+    t.domain_sessionid,
+    t.mapped_source,
+    t.is_subscriber
+  FROM
+    traffic_mapped t
+      JOIN content s
+        ON t.post_id = s.id
+),
+/* ---------------------------------- */
+/* UPVS BY SOURCE (ALL + SUBSCRIBER) */
+/* ---------------------------------- */
+story_upvs AS (
+  SELECT
+    story_id,
+    mapped_source,
+    COUNT(DISTINCT domain_sessionid) AS upvs,
+    COUNT(DISTINCT
+      CASE
+        WHEN is_subscriber = 1 THEN domain_sessionid
+      END
+    ) AS sub_upvs
+  FROM
+    story_traffic
+  GROUP BY
+    1,
+    2
+),
+/* ---------------------------------- */
+/* TOTALS */
+/* ---------------------------------- */
+story_totals AS (
+  SELECT
+    story_id,
+    SUM(upvs) AS total_upvs,
+    SUM(sub_upvs) AS total_sub_upvs
+  FROM
+    story_upvs
+  GROUP BY
+    1
+),
+/* ---------------------------------- */
+/* TOP 20 STORIES */
+/* ---------------------------------- */
+top_stories AS (
+  SELECT
+    story_id,
+    total_upvs,
+    total_sub_upvs
+  FROM
+    story_totals
+  ORDER BY
+    total_upvs DESC
+  LIMIT 20
+)
+/* ---------------------------------- */
+/* FINAL OUTPUT */
+/* ---------------------------------- */
+SELECT
+  MAX(s.hed) AS hed,
+  MAX(s.original_author) AS original_author,
+  MAX(s.site_section) AS site_section,
+  MAX(s.original_pub_date) AS original_pub_date,
+  u.mapped_source,
+  u.upvs,
+  u.sub_upvs,
+  ts.total_upvs,
+  ts.total_sub_upvs
+FROM
+  top_stories ts
+    JOIN story_upvs u
+      ON ts.story_id = u.story_id
+    JOIN content s
+      ON ts.story_id = s.id
+GROUP BY
+  ts.story_id,
+  u.mapped_source,
+  u.upvs,
+  u.sub_upvs,
+  ts.total_upvs,
+  ts.total_sub_upvs
+ORDER BY
+  ts.total_upvs DESC,
+  u.upvs DESC;
