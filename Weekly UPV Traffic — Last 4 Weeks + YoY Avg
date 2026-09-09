@@ -1,0 +1,201 @@
+SET ansi_mode = false;
+
+WITH params AS (
+  SELECT
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 28 DAYS AS start_date,
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 1 DAY AS end_date
+),
+web_all AS (
+  SELECT
+    DATE(derived_tstamp) AS visit_date,
+    COUNT(DISTINCT CONCAT(page.url, domain_sessionid)) AS upvs
+  FROM
+    gold_us_prod.spruce.gld_web_page_views CROSS JOIN params p
+  WHERE
+    app_id = 'the-new-yorker'
+    AND (
+      DATE(derived_tstamp) BETWEEN p.start_date AND p.end_date
+      OR DATE(derived_tstamp) BETWEEN
+        p.start_date - INTERVAL 365 DAYS
+      AND
+        p.end_date - INTERVAL 365 DAYS
+      OR DATE(derived_tstamp) BETWEEN
+        p.start_date - INTERVAL 730 DAYS
+      AND
+        p.end_date - INTERVAL 730 DAYS
+    )
+    AND domain_userid IS NOT NULL
+    AND lower(page.url) NOT LIKE '%verso%'
+    AND lower(page.url) NOT LIKE '%utm_medium=display%'
+    AND lower(page.url) NOT LIKE '%utm_medium=cpc%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=paid%'
+    AND lower(page.url) NOT LIKE '%utm_social-type=paid%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=cm_paid%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=fbig_direct%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=domestic_prospecting%'
+    AND lower(page.url) NOT LIKE '%source=paid%'
+  GROUP BY
+    1
+),
+app_all AS (
+  SELECT
+    DATE(derived_tstamp) AS visit_date,
+    COUNT(DISTINCT CONCAT(page.page_url, session_id)) AS upvs
+  FROM
+    gold_us_prod.spruce.gld_mobile_screen_views CROSS JOIN params p
+  WHERE
+    app_id = 'the-new-yorker-app'
+    AND (
+      DATE(derived_tstamp) BETWEEN p.start_date AND p.end_date
+      OR DATE(derived_tstamp) BETWEEN
+        p.start_date - INTERVAL 365 DAYS
+      AND
+        p.end_date - INTERVAL 365 DAYS
+      OR DATE(derived_tstamp) BETWEEN
+        p.start_date - INTERVAL 730 DAYS
+      AND
+        p.end_date - INTERVAL 730 DAYS
+    )
+    AND user.user_id IS NOT NULL
+  GROUP BY
+    1
+),
+daily AS (
+  SELECT
+    COALESCE(w.visit_date, a.visit_date) AS visit_date,
+    COALESCE(w.upvs, 0) + COALESCE(a.upvs, 0) AS upvs
+  FROM
+    web_all w
+      FULL OUTER JOIN app_all a
+        ON w.visit_date = a.visit_date
+),
+daily_with_meta AS (
+  SELECT
+    visit_date,
+    YEAR(visit_date) AS yr,
+    upvs
+  FROM
+    daily
+),
+weekly AS (
+  SELECT
+    yr,
+    CASE
+      WHEN
+        yr = 2026
+      THEN
+        FLOOR(
+          DATEDIFF(
+            visit_date,
+            (
+              SELECT
+                start_date
+              FROM
+                params
+            )
+          )
+            / 7
+        )
+          + 1
+      WHEN
+        yr = 2025
+      THEN
+        FLOOR(
+          DATEDIFF(
+            visit_date,
+            (
+              SELECT
+                start_date - INTERVAL 365 DAYS
+              FROM
+                params
+            )
+          )
+            / 7
+        )
+          + 1
+      WHEN
+        yr = 2024
+      THEN
+        FLOOR(
+          DATEDIFF(
+            visit_date,
+            (
+              SELECT
+                start_date - INTERVAL 730 DAYS
+              FROM
+                params
+            )
+          )
+            / 7
+        )
+          + 1
+    END AS week_num,
+    SUM(upvs) AS weekly_upvs
+  FROM
+    daily_with_meta
+  GROUP BY
+    yr,
+    2
+),
+week_labels AS (
+  SELECT
+    1 AS week_num,
+    CONCAT(
+      DATE_FORMAT(p.start_date, 'MM/dd'),
+      ' – ',
+      DATE_FORMAT(DATE_ADD(p.start_date, 6), 'MM/dd')
+    ) AS week_label
+  FROM
+    params p
+  UNION ALL
+  SELECT
+    2,
+    CONCAT(
+      DATE_FORMAT(DATE_ADD(p.start_date, 7), 'MM/dd'),
+      ' – ',
+      DATE_FORMAT(DATE_ADD(p.start_date, 13), 'MM/dd')
+    )
+  FROM
+    params p
+  UNION ALL
+  SELECT
+    3,
+    CONCAT(
+      DATE_FORMAT(DATE_ADD(p.start_date, 14), 'MM/dd'),
+      ' – ',
+      DATE_FORMAT(DATE_ADD(p.start_date, 20), 'MM/dd')
+    )
+  FROM
+    params p
+  UNION ALL
+  SELECT
+    4,
+    CONCAT(
+      DATE_FORMAT(DATE_ADD(p.start_date, 21), 'MM/dd'),
+      ' – ',
+      DATE_FORMAT(DATE_ADD(p.start_date, 27), 'MM/dd')
+    )
+  FROM
+    params p
+)
+SELECT
+  w26.week_num,
+  wl.week_label,
+  w26.weekly_upvs AS upvs_2026,
+  w25.weekly_upvs AS avg_2025,
+  w24.weekly_upvs AS avg_2024
+FROM
+  weekly w26
+    JOIN week_labels wl
+      ON wl.week_num = w26.week_num
+    LEFT JOIN weekly w25
+      ON w25.yr = 2025
+      AND w25.week_num = w26.week_num
+    LEFT JOIN weekly w24
+      ON w24.yr = 2024
+      AND w24.week_num = w26.week_num
+WHERE
+  w26.yr = 2026
+  AND w26.week_num BETWEEN 1 AND 4
+ORDER BY
+  w26.week_num
