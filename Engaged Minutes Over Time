@@ -1,0 +1,129 @@
+SET ansi_mode = false;
+
+WITH params AS (
+  SELECT
+    date_sub(next_day(current_date - 1, 'Sun'), 8) AS start_date,
+    date_sub(next_day(current_date - 1, 'Sun'), 2) AS end_date
+),
+
+-- DAILY WEB PAST WEEK
+daily_web AS (
+  SELECT
+    DATE(derived_tstamp) AS day,
+    SUM(page_engaged_time_in_s)/60.0 AS page_min,
+    SUM(video_engaged_time_in_s)/60.0 AS video_min
+  FROM gold_us_prod.spruce.gld_web_page_views w
+  CROSS JOIN params p
+  WHERE app_id = 'the-new-yorker'
+    AND DATE(derived_tstamp) BETWEEN p.start_date AND p.end_date
+    AND domain_userid IS NOT NULL
+    AND lower(page.url) NOT LIKE '%verso%'
+    AND lower(page.url) NOT LIKE '%utm_medium=display%'
+    AND lower(page.url) NOT LIKE '%utm_medium=cpc%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=paid%'
+    AND lower(page.url) NOT LIKE '%utm_social-type=paid%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=cm_paid%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=fbig_direct%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=domestic_prospecting%'
+    AND lower(page.url) NOT LIKE '%source=paid%'
+  GROUP BY 1
+),
+
+-- DAILY APP PAST WEEK
+daily_app AS (
+  SELECT
+    DATE(derived_tstamp) AS day,
+    SUM(screen_engaged_time_in_s)/60.0 AS page_min,
+    SUM(video_engaged_time_in_s)/60.0 AS video_min
+  FROM gold_us_prod.spruce.gld_mobile_screen_views m
+  CROSS JOIN params p
+  WHERE app_id = 'the-new-yorker-app'
+    AND DATE(derived_tstamp) BETWEEN p.start_date AND p.end_date
+    AND user.user_id IS NOT NULL
+  GROUP BY 1
+),
+
+-- COMBINE WEB + APP PAST WEEK
+daily_combined AS (
+  SELECT
+    COALESCE(w.day, a.day) AS day,
+    COALESCE(w.page_min,0) + COALESCE(a.page_min,0) AS page_minutes,
+    COALESCE(w.video_min,0) + COALESCE(a.video_min,0) AS video_minutes
+  FROM daily_web w
+  FULL OUTER JOIN daily_app a
+    ON w.day = a.day
+),
+
+-- WEB DAILY 2025
+web_2025_daily AS (
+  SELECT
+    DATE(derived_tstamp) AS day,
+    SUM(page_engaged_time_in_s)/60.0 AS page_min,
+    SUM(video_engaged_time_in_s)/60.0 AS video_min
+  FROM gold_us_prod.spruce.gld_web_page_views
+  WHERE app_id = 'the-new-yorker'
+    AND DATE(derived_tstamp) BETWEEN '2025-01-01' AND '2025-12-31'
+    AND domain_userid IS NOT NULL
+    AND lower(page.url) NOT LIKE '%verso%'
+    AND lower(page.url) NOT LIKE '%utm_medium=display%'
+    AND lower(page.url) NOT LIKE '%utm_medium=cpc%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=paid%'
+    AND lower(page.url) NOT LIKE '%utm_social-type=paid%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=cm_paid%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=fbig_direct%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=domestic_prospecting%'
+    AND lower(page.url) NOT LIKE '%source=paid%'
+  GROUP BY 1
+),
+
+-- APP DAILY 2025
+app_2025_daily AS (
+  SELECT
+    DATE(derived_tstamp) AS day,
+    SUM(screen_engaged_time_in_s)/60.0 AS page_min,
+    SUM(video_engaged_time_in_s)/60.0 AS video_min
+  FROM gold_us_prod.spruce.gld_mobile_screen_views
+  WHERE app_id = 'the-new-yorker-app'
+    AND DATE(derived_tstamp) BETWEEN '2025-01-01' AND '2025-12-31'
+    AND user.user_id IS NOT NULL
+  GROUP BY 1
+),
+
+-- COMBINE WEB + APP 2025
+combined_2025_daily AS (
+  SELECT
+    COALESCE(w.day, a.day) AS day,
+    COALESCE(w.page_min,0) + COALESCE(a.page_min,0) AS page_min,
+    COALESCE(w.video_min,0) + COALESCE(a.video_min,0) AS video_min
+  FROM web_2025_daily w
+  FULL OUTER JOIN app_2025_daily a
+    ON w.day = a.day
+),
+
+-- AVERAGE BY DAY OF WEEK 2025
+avg_2025_dow AS (
+  SELECT
+    DAYOFWEEK(day) AS dow,
+    AVG(page_min) AS avg_page_minutes,
+    AVG(video_min) AS avg_video_minutes
+  FROM combined_2025_daily
+  GROUP BY 1
+)
+
+-- FINAL OUTPUT
+SELECT day, 'Page - This Week' AS metric, page_minutes AS minutes
+FROM daily_combined
+UNION ALL
+SELECT day, 'Video - This Week', video_minutes
+FROM daily_combined
+UNION ALL
+SELECT dc.day, 'Page - 2025 Avg', a.avg_page_minutes
+FROM daily_combined dc
+JOIN avg_2025_dow a
+  ON DAYOFWEEK(dc.day) = a.dow
+UNION ALL
+SELECT dc.day, 'Video - 2025 Avg', a.avg_video_minutes
+FROM daily_combined dc
+JOIN avg_2025_dow a
+  ON DAYOFWEEK(dc.day) = a.dow
+ORDER BY day, metric;
