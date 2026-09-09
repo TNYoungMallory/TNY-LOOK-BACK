@@ -1,0 +1,245 @@
+WITH dates AS (
+    SELECT
+        date_sub(
+            date_trunc('week', date_add(current_date, 1)),
+            8
+        ) AS start_date,
+
+        date_sub(
+            date_trunc('week', date_add(current_date, 1)),
+            2
+        ) AS end_date,
+
+        NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun')
+            - INTERVAL 7 DAYS
+            - INTERVAL '90' DAY AS lookback_start
+)
+
+, sp_raw AS (
+    SELECT 
+        content.id AS content_id,
+        domain_userid,
+        domain_sessionid,
+        (
+            subscription_paywall_barrier.paywall_unit_shown = 'barrier'
+            OR subscription_paywall_barrier.placement = 'paywall-modal'
+        ) AS is_barrier,
+        page.url_path,
+        site.section AS site_section
+    FROM 
+        gold_us_prod.spruce.gld_web_page_views
+    CROSS JOIN dates
+    WHERE 
+        brand = 'The New Yorker'
+        AND market_adjusted_date BETWEEN dates.start_date AND dates.end_date
+        AND geo.country = 'US'
+        AND channel NOT IN ('paid social', 'paid search')
+    GROUP BY
+        ALL 
+)
+
+, sp AS (
+    SELECT 
+        content_id,
+        COUNT(DISTINCT domain_userid) AS uvs,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN is_barrier THEN domain_userid
+                ELSE NULL
+            END
+        ) AS full_barrier_uv,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN is_barrier 
+                    THEN domain_sessionid || url_path
+                ELSE NULL
+            END
+        ) AS full_barrier_upv
+
+    FROM 
+        sp_raw
+    GROUP BY 
+        ALL 
+)
+
+, t2 AS (
+    SELECT 
+        a.brand,
+        first(a.author) AS author,
+
+        CASE 
+            WHEN c.hed = '' OR c.hed IS NULL 
+                THEN regexp_extract(
+                    a.url,
+                    '(?i)^https?://[^/]+/(?:[^/?#]+/)*([^/?#]+)/?(?:[?#].*)?$'
+                )
+            ELSE c.hed 
+        END AS title,
+
+        last(a.section) AS site_section,
+        last(a.publish_date) AS publish_date,
+        last(a.url) AS url,
+        a.contentid,
+
+        sp.uvs,
+        sp.full_barrier_uv,
+        sp.full_barrier_upv,
+
+        SUM(linear_sub_contribution) AS sub_score,
+
+        try_divide(
+            1.000 * SUM(linear_sub_contribution),
+            sp.uvs
+        ) AS sub_cvr,
+
+        try_divide(
+            1.000 * sp.full_barrier_upv,
+            sp.uvs
+        ) AS fb_percent
+
+    FROM 
+        gold_us_prod.area_subscription_analytics.content_sub_score a
+
+    CROSS JOIN dates
+
+    LEFT JOIN sp 
+        ON a.contentid = sp.content_id
+
+    LEFT JOIN gold_us_prod.content.gld_cross_brand_live c 
+        ON c.id = a.contentid
+
+    WHERE 
+        a.country = 'US'
+        AND a.brand = 'The New Yorker'
+        AND a.sub_day BETWEEN dates.start_date AND dates.end_date
+
+    GROUP BY 
+        ALL
+)
+
+, article_rows AS (
+
+    SELECT
+        brand,
+        author,
+        title,
+        site_section,
+        publish_date,
+        url,
+        contentid,
+        uvs,
+        full_barrier_uv,
+        full_barrier_upv,
+        sub_score,
+        sub_cvr,
+        fb_percent,
+        'article view' AS data_type
+
+    FROM
+        t2
+
+    ORDER BY
+        sub_score DESC
+
+    LIMIT 20
+)
+
+, aggregated_sp AS (
+
+    SELECT
+        NULL AS brand,
+        NULL AS author,
+        NULL AS title,
+        site_section,
+        NULL AS publish_date,
+        NULL AS url,
+        NULL AS contentid,
+
+        COUNT(DISTINCT domain_userid) AS uvs,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN is_barrier = TRUE 
+                    THEN domain_userid
+                ELSE NULL
+            END
+        ) AS full_barrier_uv,
+
+        COUNT(
+            DISTINCT CASE
+                WHEN is_barrier = TRUE
+                    THEN CONCAT_WS(
+                        '|',
+                        domain_userid,
+                        domain_sessionid
+                    )
+                ELSE NULL
+            END
+        ) AS full_barrier_upv,
+
+        0 AS sub_score,
+        0 AS sub_cvr,
+        0 AS fb_percent,
+        'aggregated' AS data_type
+
+    FROM
+        sp_raw
+
+    GROUP BY
+        site_section
+)
+
+, aggregated_sub_score AS (
+
+    SELECT
+        NULL AS brand,
+        NULL AS author,
+        NULL AS title,
+        site_section,
+        NULL AS publish_date,
+        NULL AS url,
+        NULL AS contentid,
+        0 AS uvs,
+        0 AS full_barrier_uv,
+        0 AS full_barrier_upv,
+
+        SUM(sub_score) AS sub_score,
+
+        0 AS sub_cvr,
+        0 AS fb_percent,
+        'aggregated' AS data_type
+
+    FROM
+        t2
+
+    GROUP BY
+        site_section
+)
+
+SELECT
+    *
+FROM
+    article_rows
+
+UNION ALL
+
+SELECT
+    *
+FROM
+    aggregated_sp
+
+UNION ALL
+
+SELECT
+    *
+FROM
+    aggregated_sub_score
+
+ORDER BY
+    CASE
+        WHEN data_type = 'aggregated' THEN 1
+        ELSE 2
+    END,
+    sub_score DESC
