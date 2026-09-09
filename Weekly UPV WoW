@@ -1,0 +1,89 @@
+SET ansi_mode = false;
+
+WITH params AS (
+  SELECT
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 7 DAYS AS this_start,
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 1 DAY AS this_end,
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 14 DAYS AS prior_start,
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 8 DAYS AS prior_end
+),
+web AS (
+  SELECT
+    DATE(derived_tstamp) AS dt,
+    page.url || domain_userid || CAST(domain_sessionid AS STRING) AS pv_key
+  FROM
+    gold_us_prod.spruce.gld_web_page_views CROSS JOIN params p
+  WHERE
+    app_id = 'the-new-yorker'
+    AND DATE(derived_tstamp) BETWEEN p.prior_start AND p.this_end
+    AND domain_userid IS NOT NULL
+    AND lower(page.url) NOT LIKE '%verso%'
+    AND lower(page.url) NOT LIKE '%utm_medium=display%'
+    AND lower(page.url) NOT LIKE '%utm_medium=cpc%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=paid%'
+    AND lower(page.url) NOT LIKE '%utm_social-type=paid%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=cm_paid%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=fbig_direct%'
+    AND lower(page.url) NOT LIKE '%utm_campaign=domestic_prospecting%'
+    AND lower(page.url) NOT LIKE '%source=paid%'
+    AND traffic.source_channel_group NOT IN ('Paid Social', 'Paid Search')
+),
+app AS (
+  SELECT
+    DATE(derived_tstamp) AS dt,
+    page.page_url || user.user_id || CAST(session_id AS STRING) AS pv_key
+  FROM
+    gold_us_prod.spruce.gld_mobile_screen_views CROSS JOIN params p
+  WHERE
+    app_id = 'the-new-yorker-app'
+    AND DATE(derived_tstamp) BETWEEN p.prior_start AND p.this_end
+    AND user.user_id IS NOT NULL
+),
+all_traffic AS (
+  SELECT
+    *
+  FROM
+    web
+  UNION ALL
+  SELECT
+    *
+  FROM
+    app
+)
+SELECT
+  COUNT(DISTINCT
+    CASE
+      WHEN dt BETWEEN p.this_start AND p.this_end THEN pv_key
+    END
+  ) AS this_week_upvs,
+  COUNT(DISTINCT
+    CASE
+      WHEN dt BETWEEN p.prior_start AND p.prior_end THEN pv_key
+    END
+  ) AS prior_week_upvs,
+  ROUND(
+    (
+      COUNT(DISTINCT
+        CASE
+          WHEN dt BETWEEN p.this_start AND p.this_end THEN pv_key
+        END
+      )
+        - COUNT(DISTINCT
+          CASE
+            WHEN dt BETWEEN p.prior_start AND p.prior_end THEN pv_key
+          END
+        )
+    )
+      * 1.0
+      / NULLIF(
+        COUNT(DISTINCT
+          CASE
+            WHEN dt BETWEEN p.prior_start AND p.prior_end THEN pv_key
+          END
+        ),
+        0
+      ),
+    4
+  ) AS wow_pct_change
+FROM
+  all_traffic CROSS JOIN params p
