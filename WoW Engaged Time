@@ -1,0 +1,70 @@
+SET ansi_mode = false;
+
+WITH params AS (
+  SELECT
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 7 DAYS AS this_start,
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 1 DAY AS this_end,
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 14 DAYS AS prior_start,
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 8 DAYS AS prior_end
+),
+web AS (
+  SELECT
+    DATE(derived_tstamp) AS dt,
+    page_engaged_time_in_s,
+    video_engaged_time_in_s,
+    audio_engaged_time_in_s
+  FROM
+    gold_us_prod.spruce.gld_web_page_views CROSS JOIN params p
+  WHERE
+    app_id = 'the-new-yorker'
+    AND DATE(derived_tstamp) BETWEEN p.prior_start AND p.this_end
+    AND domain_userid IS NOT NULL
+),
+app AS (
+  SELECT
+    DATE(derived_tstamp) AS dt,
+    screen_engaged_time_in_s AS page_engaged_time_in_s,
+    0 AS video_engaged_time_in_s,
+    audio_engaged_time_in_s
+  FROM
+    gold_us_prod.spruce.gld_mobile_screen_views CROSS JOIN params p
+  WHERE
+    app_id = 'the-new-yorker-app'
+    AND DATE(derived_tstamp) BETWEEN p.prior_start AND p.this_end
+    AND user.user_id IS NOT NULL
+),
+all_traffic AS (
+  SELECT
+    *
+  FROM
+    web
+  UNION ALL
+  SELECT
+    *
+  FROM
+    app
+)
+SELECT
+  SUM(
+    CASE
+      WHEN
+        dt BETWEEN p.this_start AND p.this_end
+      THEN
+        (page_engaged_time_in_s + video_engaged_time_in_s + audio_engaged_time_in_s) / 60.0
+    END
+  ) AS this_week_minutes,
+  SUM(
+    CASE
+      WHEN
+        dt BETWEEN p.prior_start AND p.prior_end
+      THEN
+        (page_engaged_time_in_s + video_engaged_time_in_s + audio_engaged_time_in_s) / 60.0
+    END
+  ) AS prior_week_minutes,
+  ROUND(
+    (SUM(CASE WHEN dt BETWEEN p.this_start AND p.this_end THEN (page_engaged_time_in_s + video_engaged_time_in_s + audio_engaged_time_in_s) / 60.0 END)
+     - SUM(CASE WHEN dt BETWEEN p.prior_start AND p.prior_end THEN (page_engaged_time_in_s + video_engaged_time_in_s + audio_engaged_time_in_s) / 60.0 END))
+    / NULLIF(SUM(CASE WHEN dt BETWEEN p.prior_start AND p.prior_end THEN (page_engaged_time_in_s + video_engaged_time_in_s + audio_engaged_time_in_s) / 60.0 END), 0)
+  , 4) AS wow_pct_change
+FROM
+  all_traffic CROSS JOIN params p
