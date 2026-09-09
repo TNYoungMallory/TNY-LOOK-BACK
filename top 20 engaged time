@@ -1,0 +1,183 @@
+SET ansi_mode = false;
+
+/* ---------------------------------- */
+/* PARAMETERS */
+/* ---------------------------------- */
+WITH params AS (
+  SELECT
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 8 DAYS AS start_date,
+    NEXT_DAY(CURRENT_DATE - INTERVAL 8 DAYS, 'Sun') - INTERVAL 2 DAY  AS end_date,
+    CURRENT_DATE - INTERVAL 1 YEAR AS classic_cutoff
+),
+
+/* ---------------------------------- */
+/* CONTENT METADATA */
+/* ---------------------------------- */
+content AS (
+  SELECT
+    l.id,
+    l.full_url,
+    l.hed,
+    l.original_author,
+    l.channel AS site_section,
+    l.type AS content_type,
+    l.original_pub_date,
+    MAX(p.published_date) AS latest_revision_date
+  FROM gold_us_prod.content.gld_cross_brand_live l
+  LEFT JOIN silver_us_prod.content.slv_cross_brand_published p
+    ON l.id = p.id
+    AND p.brand = 'The New Yorker'
+  WHERE lower(l.full_url) NOT LIKE '%verso%'
+  GROUP BY 1,2,3,4,5,6,7
+),
+
+/* ---------------------------------- */
+/* STORIES IN SCOPE */
+/* ---------------------------------- */
+stories_in_scope AS (
+  SELECT
+    *,
+    CASE
+      WHEN original_pub_date BETWEEN start_date AND end_date THEN 'New'
+      WHEN original_pub_date <= classic_cutoff THEN 'Classic'
+    END AS story_type
+  FROM content
+  CROSS JOIN params
+  WHERE original_pub_date BETWEEN start_date AND end_date
+     OR original_pub_date <= classic_cutoff
+),
+
+/* ---------------------------------- */
+/* WEB TRAFFIC */
+/* ---------------------------------- */
+web_traffic AS (
+  SELECT
+    wpv.content.id AS post_id,
+    wpv.page.url AS url_clean,
+    wpv.domain_userid,
+    wpv.domain_sessionid,
+    wpv.page_engaged_time_in_s,
+    wpv.video_engaged_time_in_s,
+    wpv.audio_engaged_time_in_s,
+    wpv.total_engaged_time_in_s AS total_engaged_time_in_s,
+    wpv.derived_tstamp AS ts_action
+  FROM gold_us_prod.spruce.gld_web_page_views wpv
+  JOIN params p
+    ON DATE(wpv.derived_tstamp) BETWEEN p.start_date AND p.end_date
+  WHERE wpv.app_id = 'the-new-yorker'
+    AND lower(wpv.page.url) NOT LIKE '%verso%'
+    -- only organic channels
+    AND wpv.traffic.source_channel_group IS NOT NULL
+    AND lower(wpv.traffic.source_channel_group) IN (
+      'organic social', 'organic search', 'direct', 'email', 'internal', 'referral'
+    )
+),
+
+/* ---------------------------------- */
+/* APP TRAFFIC */
+/* ---------------------------------- */
+app_traffic AS (
+  SELECT
+    msv.page.content_id AS post_id,
+    msv.page.page_url AS url_clean,
+    msv.user.user_id AS domain_userid,
+    msv.session_id AS domain_sessionid,
+    msv.screen_engaged_time_in_s AS page_engaged_time_in_s,
+    0 AS video_engaged_time_in_s,
+    msv.audio_engaged_time_in_s,
+    msv.screen_engaged_time_in_s AS total_engaged_time_in_s,
+    msv.derived_tstamp AS ts_action
+  FROM gold_us_prod.spruce.gld_mobile_screen_views msv
+  JOIN params p
+    ON DATE(msv.derived_tstamp) BETWEEN p.start_date AND p.end_date
+  WHERE msv.app_id = 'the-new-yorker-app'
+    AND msv.traffic.source_channel_group IS NOT NULL
+    AND lower(msv.traffic.source_channel_group) IN (
+      'organic social', 'organic search', 'direct', 'email', 'internal', 'referral'
+    )
+),
+
+/* ---------------------------------- */
+/* UNION WEB + APP TRAFFIC */
+/* ---------------------------------- */
+traffic AS (
+  SELECT * FROM web_traffic
+  UNION ALL
+  SELECT * FROM app_traffic
+),
+
+/* ---------------------------------- */
+/* JOIN TO STORIES */
+/* ---------------------------------- */
+story_traffic AS (
+  SELECT
+    s.*,
+    t.url_clean,
+    t.domain_userid,
+    t.domain_sessionid,
+    t.page_engaged_time_in_s,
+    t.video_engaged_time_in_s,
+    t.audio_engaged_time_in_s,
+    t.total_engaged_time_in_s,
+    t.ts_action
+  FROM traffic t
+  JOIN stories_in_scope s
+    ON t.post_id = s.id
+  WHERE s.story_type IN ('New', 'Classic')
+),
+
+/* ---------------------------------- */
+/* AGGREGATION */
+/* ---------------------------------- */
+story_performance AS (
+  SELECT
+    story_type,
+    site_section,
+    url_clean,
+    full_url,
+    hed,
+    original_author,
+    original_pub_date,
+
+    COUNT(DISTINCT CONCAT(url_clean, domain_sessionid))
+      FILTER (WHERE domain_userid IS NOT NULL) AS unique_pageviews,
+
+    SUM(page_engaged_time_in_s) / 60 AS engaged_page_minutes,
+    SUM(video_engaged_time_in_s) / 60 AS engaged_video_minutes,
+    SUM(audio_engaged_time_in_s) / 60 AS engaged_audio_minutes,
+    SUM(total_engaged_time_in_s) / 60 AS engaged_total_minutes
+
+  FROM story_traffic
+  GROUP BY
+    story_type,
+    site_section,
+    url_clean,
+    full_url,
+    hed,
+    original_author,
+    original_pub_date
+)
+
+/* ---------------------------------- */
+/* FINAL OUTPUT */
+/* ---------------------------------- */
+SELECT
+  sp.story_type,
+  sp.site_section,
+  sp.url_clean,
+  sp.full_url,
+  sp.hed,
+  sp.original_author,
+  sp.original_pub_date,
+  sp.unique_pageviews,
+  sp.engaged_page_minutes,
+  sp.engaged_video_minutes,
+  sp.engaged_audio_minutes,
+  sp.engaged_total_minutes
+FROM story_performance sp
+WHERE sp.hed IS NOT NULL
+  AND sp.hed NOT LIKE '%Daily Cartoon%'
+ORDER BY
+  sp.story_type,
+  sp.engaged_total_minutes DESC
+LIMIT 20;
