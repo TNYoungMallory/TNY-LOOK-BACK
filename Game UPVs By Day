@@ -1,0 +1,85 @@
+SET ansi_mode = false;
+
+WITH params AS (
+  SELECT
+    date_sub(current_date, dayofweek(current_date)) AS end_date,
+    date_sub(current_date, dayofweek(current_date) + 6) AS start_date
+),
+content AS (
+  SELECT
+    l.id,
+    l.hed,
+    CASE
+      WHEN lower(l.hed) LIKE '%mini crossword%' THEN 'Mini Crossword'
+      WHEN lower(l.hed) LIKE '%crossword%' THEN 'Crossword'
+      WHEN lower(l.hed) LIKE '%shuffalo%' THEN 'Shuffalo'
+      WHEN lower(l.hed) LIKE '%cryptic%' THEN 'Cryptic Crossword'
+      WHEN lower(l.hed) LIKE '%catalogues%' THEN 'Catalogues'
+      WHEN lower(l.hed) LIKE '%name drop%' THEN 'Name Drop'
+      WHEN lower(l.hed) LIKE '%connections%' THEN 'Connections'
+      WHEN lower(l.hed) LIKE '%laugh lines%' THEN 'Laugh Lines'
+      WHEN lower(l.full_url) LIKE '%/puzzles-and-games%' THEN 'Other Games'
+      ELSE 'Other Games'
+    END AS game_type
+  FROM
+    gold_us_prod.content.gld_cross_brand_live l
+  WHERE
+    l.brand = 'The New Yorker'
+    AND l.market = 'US'
+    AND (
+      lower(l.hed) LIKE '%crossword%'
+      OR lower(l.hed) LIKE '%shuffalo%'
+      OR lower(l.hed) LIKE '%cryptic%'
+      OR lower(l.hed) LIKE '%catalogues%'
+      OR lower(l.hed) LIKE '%name drop%'
+      OR lower(l.hed) LIKE '%connections%'
+      OR lower(l.full_url) LIKE '%/puzzles-and-games%'
+    )
+),
+web AS (
+  SELECT
+    DATE(wpv.derived_tstamp) AS dt,
+    wpv.content.id AS post_id,
+    wpv.domain_sessionid
+  FROM
+    gold_us_prod.spruce.gld_web_page_views wpv CROSS JOIN params p
+  WHERE
+    wpv.app_id = 'the-new-yorker'
+    AND DATE(wpv.derived_tstamp) BETWEEN p.start_date AND p.end_date
+),
+app AS (
+  SELECT
+    DATE(msv.derived_tstamp) AS dt,
+    msv.page.content_id AS post_id,
+    msv.session_id AS domain_sessionid
+  FROM
+    gold_us_prod.spruce.gld_mobile_screen_views msv CROSS JOIN params p
+  WHERE
+    msv.app_id = 'the-new-yorker-app'
+    AND DATE(msv.derived_tstamp) BETWEEN p.start_date AND p.end_date
+),
+traffic AS (
+  SELECT
+    *
+  FROM
+    web
+  UNION ALL
+  SELECT
+    *
+  FROM
+    app
+)
+SELECT
+  t.dt,
+  c.game_type,
+  COUNT(DISTINCT t.domain_sessionid) AS upvs
+FROM
+  traffic t
+    JOIN content c
+      ON t.post_id = c.id
+GROUP BY
+  t.dt,
+  c.game_type
+ORDER BY
+  t.dt,
+  c.game_type
