@@ -1,0 +1,153 @@
+SET ansi_mode = false;
+
+WITH params AS (
+  SELECT
+    current_date - INTERVAL 2 DAYS AS end_date, -- Prior Saturday (yesterday, when run Monday)
+    current_date - INTERVAL 8 DAYS AS start_date -- Prior Sunday
+),
+content AS (
+  SELECT
+    l.id,
+    l.full_url,
+    l.hed,
+    l.original_author,
+    l.channel AS site_section,
+    l.original_pub_date
+  FROM
+    gold_us_prod.content.gld_cross_brand_live l
+  WHERE
+    lower(l.full_url) NOT LIKE '%verso%'
+    AND lower(l.hed) NOT LIKE '%crossword%'
+    AND lower(l.hed) NOT LIKE '%shuffalo%'
+    AND lower(l.hed) NOT LIKE '%puzzles%'
+    AND lower(l.hed) NOT LIKE '%games%'
+    AND lower(l.hed) NOT LIKE '%catalogues%'
+    AND lower(l.hed) NOT IN ('the new yorker', 'page not found', 'my account')
+    AND l.type = 'article'
+),
+web_traffic AS (
+  SELECT
+    wpv.content.id AS post_id,
+    LOWER(REGEXP_REPLACE(wpv.page.url, '\\?.*$', '')) AS url_clean,
+    wpv.domain_userid,
+    wpv.domain_sessionid,
+    wpv.page_engaged_time_in_s,
+    wpv.video_engaged_time_in_s,
+    wpv.audio_engaged_time_in_s
+  FROM
+    gold_us_prod.spruce.gld_web_page_views wpv CROSS JOIN params p
+  WHERE
+    wpv.app_id = 'the-new-yorker'
+    AND DATE(wpv.derived_tstamp) >= p.start_date
+    AND DATE(wpv.derived_tstamp) <= p.end_date
+    AND lower(wpv.page.url) NOT LIKE '%verso%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_medium=display%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_medium=cpc%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=paid%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_social-type=paid%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=cm_paid%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=fbig_direct%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=domestic_prospecting%'
+    AND lower(wpv.page.url) NOT LIKE '%source=paid%'
+    AND wpv.traffic.source_channel_group NOT IN ('Paid Social', 'Paid Search')
+),
+app_traffic AS (
+  SELECT
+    msv.page.content_id AS post_id,
+    LOWER(REGEXP_REPLACE(msv.page.page_url, '\\?.*$', '')) AS url_clean,
+    msv.user.user_id AS domain_userid,
+    msv.session_id AS domain_sessionid,
+    msv.screen_engaged_time_in_s AS page_engaged_time_in_s,
+    0 AS video_engaged_time_in_s,
+    msv.audio_engaged_time_in_s
+  FROM
+    gold_us_prod.spruce.gld_mobile_screen_views msv CROSS JOIN params p
+  WHERE
+    msv.app_id = 'the-new-yorker-app'
+    AND DATE(msv.derived_tstamp) >= p.start_date
+    AND DATE(msv.derived_tstamp) <= p.end_date
+    AND lower(msv.page.page_url) NOT LIKE '%verso%'
+),
+traffic AS (
+  SELECT
+    *
+  FROM
+    web_traffic
+  UNION ALL
+  SELECT
+    *
+  FROM
+    app_traffic
+),
+story_traffic AS (
+  SELECT
+    c.id AS story_id,
+    c.full_url,
+    c.hed,
+    c.original_author,
+    c.site_section,
+    c.original_pub_date,
+    t.url_clean,
+    t.domain_userid,
+    t.domain_sessionid,
+    t.page_engaged_time_in_s,
+    t.video_engaged_time_in_s,
+    t.audio_engaged_time_in_s
+  FROM
+    traffic t
+      JOIN content c
+        ON t.post_id = c.id
+),
+story_performance AS (
+  SELECT
+    story_id,
+    site_section,
+    hed,
+    original_author,
+    original_pub_date,
+    MIN(url_clean) AS url_clean,
+    MAX(full_url) AS full_url,
+    COUNT(DISTINCT domain_sessionid) AS unique_pageviews,
+    SUM(COALESCE(page_engaged_time_in_s, 0)) / 60 AS engaged_page_minutes,
+    SUM(COALESCE(video_engaged_time_in_s, 0)) / 60 AS engaged_video_minutes,
+    SUM(COALESCE(audio_engaged_time_in_s, 0)) / 60 AS engaged_audio_minutes,
+    (
+      SUM(COALESCE(page_engaged_time_in_s, 0))
+        + SUM(COALESCE(video_engaged_time_in_s, 0))
+        + SUM(COALESCE(audio_engaged_time_in_s, 0))
+    )
+      / 60 AS total_engaged_minutes
+  FROM
+    story_traffic
+  GROUP BY
+    story_id,
+    site_section,
+    hed,
+    original_author,
+    original_pub_date
+),
+ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (ORDER BY unique_pageviews DESC) AS rank
+  FROM
+    story_performance
+)
+SELECT
+  rank,
+  site_section,
+  hed,
+  original_author,
+  original_pub_date,
+  url_clean,
+  unique_pageviews,
+  total_engaged_minutes,
+  engaged_page_minutes,
+  engaged_video_minutes,
+  engaged_audio_minutes
+FROM
+  ranked
+WHERE
+  rank <= 20
+ORDER BY
+  rank;
