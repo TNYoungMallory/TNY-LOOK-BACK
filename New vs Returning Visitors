@@ -1,0 +1,246 @@
+SET ansi_mode = false;
+
+WITH params AS (
+  SELECT
+    date_sub(current_date, dayofweek(current_date) + 6) AS start_date,
+    date_sub(current_date, dayofweek(current_date)) AS end_date
+),
+/* ===== LAST WEEK ===== */
+-- Organic web traffic for the week
+web_traffic AS (
+  SELECT
+    wpv.domain_userid
+  FROM
+    gold_us_prod.spruce.gld_web_page_views wpv CROSS JOIN params p
+  WHERE
+    wpv.app_id = 'the-new-yorker'
+    AND DATE(wpv.derived_tstamp) BETWEEN p.start_date AND p.end_date
+    AND wpv.domain_userid IS NOT NULL
+    AND lower(wpv.page.url) NOT LIKE '%verso%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_medium=display%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_medium=cpc%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=paid%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_social-type=paid%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=cm_paid%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=fbig_direct%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=domestic_prospecting%'
+    AND lower(wpv.page.url) NOT LIKE '%source=paid%'
+    AND wpv.traffic.source_channel_group NOT IN ('Paid Social', 'Paid Search')
+),
+-- App traffic for the week
+app_traffic AS (
+  SELECT
+    msv.user.user_id AS domain_userid
+  FROM
+    gold_us_prod.spruce.gld_mobile_screen_views msv CROSS JOIN params p
+  WHERE
+    msv.app_id = 'the-new-yorker-app'
+    AND DATE(msv.derived_tstamp) BETWEEN p.start_date AND p.end_date
+    AND msv.user.user_id IS NOT NULL
+),
+-- All unique visitors last week (site + app)
+week_visitors AS (
+  SELECT DISTINCT
+    domain_userid
+  FROM
+    web_traffic
+  UNION
+  SELECT DISTINCT
+    domain_userid
+  FROM
+    app_traffic
+),
+-- Returning = visited in 30 days before the week started
+prior_web AS (
+  SELECT DISTINCT
+    wpv.domain_userid
+  FROM
+    gold_us_prod.spruce.gld_web_page_views wpv CROSS JOIN params p
+  WHERE
+    wpv.app_id = 'the-new-yorker'
+    AND DATE(wpv.derived_tstamp) BETWEEN date_sub(p.start_date, 30) AND date_sub(p.start_date, 1)
+    AND wpv.domain_userid IS NOT NULL
+),
+prior_app AS (
+  SELECT DISTINCT
+    msv.user.user_id AS domain_userid
+  FROM
+    gold_us_prod.spruce.gld_mobile_screen_views msv CROSS JOIN params p
+  WHERE
+    msv.app_id = 'the-new-yorker-app'
+    AND DATE(msv.derived_tstamp) BETWEEN date_sub(p.start_date, 30) AND date_sub(p.start_date, 1)
+    AND msv.user.user_id IS NOT NULL
+),
+returning_visitors AS (
+  SELECT
+    domain_userid
+  FROM
+    prior_web
+  UNION
+  SELECT
+    domain_userid
+  FROM
+    prior_app
+),
+-- Classify last week
+last_week AS (
+  SELECT
+    CASE
+      WHEN rv.domain_userid IS NOT NULL THEN 'Returning'
+      ELSE 'New'
+    END AS visitor_type,
+    COUNT(DISTINCT wv.domain_userid) AS unique_visitors
+  FROM
+    week_visitors wv
+      LEFT JOIN returning_visitors rv
+        ON wv.domain_userid = rv.domain_userid
+  GROUP BY
+    1
+),
+/* ===== YTD WEEKLY AVERAGE ===== */
+-- Generate all completed Sun-Sat weeks in 2026 YTD before last week
+week_starts AS (
+  SELECT
+    EXPLODE(
+      SEQUENCE(
+        DATE('2026-01-04'), -- first Sunday of 2026
+        (
+          SELECT
+            date_sub(start_date, 7)
+          FROM
+            params
+        ),
+        INTERVAL 7 DAYS
+      )
+    ) AS week_start
+),
+week_ranges AS (
+  SELECT
+    week_start,
+    date_add(week_start, 6) AS week_end
+  FROM
+    week_starts
+),
+-- For each YTD week, gather unique organic visitors (web + app)
+ytd_web AS (
+  SELECT
+    wr.week_start,
+    wpv.domain_userid
+  FROM
+    gold_us_prod.spruce.gld_web_page_views wpv
+      JOIN week_ranges wr
+        ON DATE(wpv.derived_tstamp) BETWEEN wr.week_start AND wr.week_end
+  WHERE
+    wpv.app_id = 'the-new-yorker'
+    AND wpv.domain_userid IS NOT NULL
+    AND lower(wpv.page.url) NOT LIKE '%verso%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_medium=display%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_medium=cpc%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=paid%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_social-type=paid%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=cm_paid%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=fbig_direct%'
+    AND lower(wpv.page.url) NOT LIKE '%utm_campaign=domestic_prospecting%'
+    AND lower(wpv.page.url) NOT LIKE '%source=paid%'
+    AND wpv.traffic.source_channel_group NOT IN ('Paid Social', 'Paid Search')
+),
+ytd_app AS (
+  SELECT
+    wr.week_start,
+    msv.user.user_id AS domain_userid
+  FROM
+    gold_us_prod.spruce.gld_mobile_screen_views msv
+      JOIN week_ranges wr
+        ON DATE(msv.derived_tstamp) BETWEEN wr.week_start AND wr.week_end
+  WHERE
+    msv.app_id = 'the-new-yorker-app'
+    AND msv.user.user_id IS NOT NULL
+),
+ytd_week_visitors AS (
+  SELECT DISTINCT
+    week_start,
+    domain_userid
+  FROM
+    ytd_web
+  UNION
+  SELECT DISTINCT
+    week_start,
+    domain_userid
+  FROM
+    ytd_app
+),
+-- For each YTD week, determine returning (visited 30 days before that week)
+ytd_prior_web AS (
+  SELECT DISTINCT
+    wr.week_start,
+    wpv.domain_userid
+  FROM
+    gold_us_prod.spruce.gld_web_page_views wpv
+      JOIN week_ranges wr
+        ON DATE(wpv.derived_tstamp) BETWEEN
+          date_sub(wr.week_start, 30)
+        AND
+          date_sub(wr.week_start, 1)
+  WHERE
+    wpv.app_id = 'the-new-yorker'
+    AND wpv.domain_userid IS NOT NULL
+),
+ytd_prior_app AS (
+  SELECT DISTINCT
+    wr.week_start,
+    msv.user.user_id AS domain_userid
+  FROM
+    gold_us_prod.spruce.gld_mobile_screen_views msv
+      JOIN week_ranges wr
+        ON DATE(msv.derived_tstamp) BETWEEN
+          date_sub(wr.week_start, 30)
+        AND
+          date_sub(wr.week_start, 1)
+  WHERE
+    msv.app_id = 'the-new-yorker-app'
+    AND msv.user.user_id IS NOT NULL
+),
+ytd_returning AS (
+  SELECT
+    week_start,
+    domain_userid
+  FROM
+    ytd_prior_web
+  UNION
+  SELECT
+    week_start,
+    domain_userid
+  FROM
+    ytd_prior_app
+),
+ytd_classified AS (
+  SELECT
+    wv.week_start,
+    CASE
+      WHEN rv.domain_userid IS NOT NULL THEN 'Returning'
+      ELSE 'New'
+    END AS visitor_type,
+    COUNT(DISTINCT wv.domain_userid) AS unique_visitors
+  FROM
+    ytd_week_visitors wv
+      LEFT JOIN ytd_returning rv
+        ON wv.domain_userid = rv.domain_userid
+        AND wv.week_start = rv.week_start
+  GROUP BY
+    1,
+    2
+),
+ytd_avg AS (
+  SELECT
+    visitor_type,
+    ROUND(AVG(unique_visitors)) AS avg_weekly_uvs
+  FROM
+    ytd_classified
+  GROUP BY
+    1
+)
+/* ===== FINAL: unpivoted for stacked bar (period × visitor_type) ===== */
+SELECT 'Last Week' AS period, visitor_type, unique_visitors AS uvs FROM last_week
+UNION ALL
+SELECT 'YTD Avg' AS period, visitor_type, avg_weekly_uvs AS uvs FROM ytd_avg
+ORDER BY period, visitor_type
